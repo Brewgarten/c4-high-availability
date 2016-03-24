@@ -1,0 +1,2 @@
+include versioneer.py
+include c4/devices/ha/_version.py
