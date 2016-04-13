@@ -58,6 +58,13 @@ def system(request, temporaryDatabasePaths, cleandir, temporaryIPCPath, systemMa
         "heartbeat.interval": heartbeatInterval,
         "heartbeat.timeout": heartbeatTimeout
     }
+    if "event.handlers" in parameters:
+        # TODO: adjust serialization in configuration.addNode() and other places to properly handle details
+        haDeviceInfo.properties["event.handlers"] = {
+            "events": parameters["event.handlers"].events,
+            "handlers": parameters["event.handlers"].handlers
+        }
+    log.info(haDeviceInfo.toJSON(includeClassInfo=True, pretty=True))
 
     node1 = NodeInfo("node1", "ipc://node1-peer.ipc", role=Roles.ACTIVE)
     node1.addDevice(haDeviceInfo)
@@ -109,7 +116,7 @@ def system(request, temporaryDatabasePaths, cleandir, temporaryIPCPath, systemMa
 
     request.addfinalizer(systemTeardown)
 
-    logging.getLogger("c4.devices.ha").setLevel(logging.DEBUG)
+#     logging.getLogger("c4.devices.ha").setLevel(logging.DEBUG)
 #     logging.getLogger("c4.messaging.zeromqMessaging.Peer").setLevel(logging.DEBUG)
 
     for node, systemManager in sorted(systemSetup.items()):

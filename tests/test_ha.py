@@ -3,18 +3,42 @@ import time
 
 import pytest
 
-from c4.devices.ha.raft import RaftRoles
+from c4.devices.ha.raft import RaftRoles, EventHandlerInfo
 from c4.messaging.zeromqMessaging import RouterClient
 from c4.system.configuration import Configuration
 from c4.system.messages import Status
+from c4.utils.util import getFullModuleName, SharedDictWithLock
 
 
 log = logging.getLogger(__name__)
 
+eventHandlerResults = SharedDictWithLock()
+
+@pytest.fixture
+def cleanEventHandlerResults():
+    eventHandlerResults.lock.acquire()
+    for key in eventHandlerResults.keys():
+        del eventHandlerResults[key]
+    eventHandlerResults.lock.release()
+
+def handleNewLeaderElected(name):
+    log.info("event handling new leader '%s' elected", name)
+    eventHandlerResults["handleNewLeaderElected"] = name
+
+def handleNodeLeave(name):
+    log.info("event handling node '%s' leave", name)
+    eventHandlerResults["handleNodeLeave"] = name
+
+eventHandlers = EventHandlerInfo()
+eventHandlers.events = {
+    "handleNewLeaderElected": getFullModuleName(handleNewLeaderElected) + ".handleNewLeaderElected",
+    "handleNodeLeave": getFullModuleName(handleNodeLeave) + ".handleNodeLeave",
+}
+
 class TestActiveNode():
 
-    @pytest.mark.parametrize("system", [{"passiveNodes": 2}], indirect=True)
-    def test_basic(self, system):
+    @pytest.mark.parametrize("system", [{"passiveNodes": 2, "event.handlers": eventHandlers}], indirect=True)
+    def test_basic(self, system, cleanEventHandlerResults):
 
         # wait for at least one heart beat before making active node unavailable
         time.sleep(5)
@@ -25,6 +49,7 @@ class TestActiveNode():
         configuration = Configuration()
         activeNode = configuration.getSystemManagerNodeName()
         assert activeNode != "node1"
+        assert eventHandlerResults["handleNewLeaderElected"] != "node1"
 
         client = RouterClient(activeNode)
         # TODO: verify other properties: term, responsible for, etc.
@@ -33,8 +58,8 @@ class TestActiveNode():
 
 class TestPassiveNode():
 
-    @pytest.mark.parametrize("system", [{"passiveNodes": 2}], indirect=True)
-    def test_basic(self, system):
+    @pytest.mark.parametrize("system", [{"passiveNodes": 2, "event.handlers": eventHandlers}], indirect=True)
+    def test_basic(self, system, cleanEventHandlerResults):
 
         # wait for at least one heart beat before making passive node unavailable
         time.sleep(5)
@@ -50,12 +75,17 @@ class TestPassiveNode():
         status = client.sendRequest(Status("{activeNode}/ha".format(activeNode=activeNode)), timeout=1)
         log.info(status.toJSON(pretty=True))
 
-        # TODO: for now include failed node in status but eventually implement callbacks
-        assert "node2/ha" in status.unavailable
+        assert "node2" in status.unavailable
+        assert eventHandlerResults["handleNodeLeave"] == "node2"
 
 class TestThinNode():
 
-    @pytest.mark.parametrize("system", [{"passiveNodes": 2, "thinNodes": 1}], indirect=True)
+    @pytest.mark.parametrize("system", [{
+                                "passiveNodes": 2,
+                                "thinNodes": 1,
+                                "event.handlers": eventHandlers
+                             }],
+                             indirect=True)
     def test_basic(self, system):
 
         # wait for at least one heart beat before making passive node unavailable
@@ -72,5 +102,6 @@ class TestThinNode():
         status = client.sendRequest(Status("{activeNode}/ha".format(activeNode=activeNode)), timeout=1)
         log.info(status.toJSON(pretty=True))
 
-        # TODO: for now include failed node in status but eventually implement callbacks
-        assert "node4/ha" in status.unavailable
+        assert "node4" in status.unavailable
+        assert eventHandlerResults["handleNodeLeave"] == "node4"
+

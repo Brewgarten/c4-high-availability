@@ -40,19 +40,24 @@ Functionality
 
 from __future__ import division
 
+from abc import ABCMeta
 import ctypes
 import datetime
+import inspect
 import logging
 import multiprocessing
 import time
+import types
 
-from c4.messaging.base import Envelope
-from c4.messaging.zeromqMessaging import RouterClient
-from c4.system.configuration import Configuration, Roles, States
+from c4.messaging import (Envelope, RouterClient)
+from c4.system.configuration import (Configuration, Roles, States)
 from c4.system.deviceManager import (DeviceManagerImplementation, DeviceManagerStatus)
 from c4.utils.enum import Enum
+from c4.utils.jsonutil import JSONSerializable
 from c4.utils.logutil import ClassLogger
-from c4.utils.util import SharedDictWithLock
+from c4.utils.util import (SharedDictWithLock,
+                           callWithVariableArguments,
+                           getFullModuleName)
 
 
 log = logging.getLogger(__name__)
@@ -161,6 +166,181 @@ class Election(object):
         else:
             self.log.error("'%s' does not match type '%s'", value, (str, unicode))
 
+@ClassLogger
+class EventHandler(object):
+    """
+    A Raft event handler implementation
+    """
+    __metaclass__ = ABCMeta
+
+    def checkHeartbeat(self, details):
+        """
+        Check heartbeat detailed results
+
+        :param details: details to be checked
+        :type details: dict
+        """
+
+    def handleNewLeaderElected(self, name):
+        """
+        Handle new `leader` elected event
+
+        :param name: new `leader` node
+        :type name: str
+        """
+
+    def handleNodeJoin(self, name):
+        """
+        Handle node join event
+
+        :param name: node that joined
+        :type name: str
+        """
+
+    def handleNodeLeave(self, name):
+        """
+        Handle node leave event
+
+        :param name: node that joined
+        :type name: str
+        """
+
+    def performHeartbeat(self, details):
+        """
+        Perform detailed heartbeat and store results in details
+
+        :param details: details
+        :type details: dict
+        """
+
+class EventHandlerInfo(JSONSerializable):
+    """
+    Event handler information that contains references to
+    - handlers: list of :class:`~EventHandler` implementations
+    - events: mappings of events to functional event handlers
+    """
+    def __init__(self):
+        self.handlers = []
+        self.events = {}
+
+    def getEventHandlerWrapper(self):
+        """
+        Get event handler wrapper for the functional event mappings
+
+        :returns: event handler wrapper
+        :rtype: :class:`~EventHandlerWrapper`
+        """
+        return EventHandlerWrapper(self.events)
+
+    def getHandlers(self):
+        """
+        Get a list of :class:`~EventHandler` implementations
+
+        :returns: list of event handler implementations
+        :rtype: [:class:`~EventHandler`]
+        """
+        handlers = []
+        for rawHandler in self.handlers:
+            handler = load(rawHandler)
+            if handler:
+                handlers.append(handler())
+        return handlers
+
+@ClassLogger
+class EventHandlerProxy(EventHandler):
+    """
+    A Raft event handler proxy implementation that passes event calls to the
+    established event handler implementations and the individual event functional handlers
+
+    :param info: event handler information
+    :type info: :class:`~EventHandlerInfo`
+    """
+    def __init__(self, info):
+        super(EventHandlerProxy, self).__init__()
+        self.handlers = info.getHandlers()
+        self.eventHandlerWrapper = info.getEventHandlerWrapper()
+        # dynamically attach event handler proxies for the known events
+        for name, _ in inspect.getmembers(EventHandler, inspect.ismethod):
+            if not name.startswith("_"):
+                self.updateHandler(name)
+
+    def updateHandler(self, event):
+        """
+        Dynamically attach a handler proxy method to this instance for the specified event
+
+        :param event: event name
+        :type event: str
+        """
+        def handle(self, *arguments, **keyValueArguments):
+            results = {}
+            for handler in self.handlers:
+                name = "{module}.{name}".format(module=getFullModuleName(handler), name=handler.__class__.__name__)
+                try:
+                    results[name] = callWithVariableArguments(getattr(handler, event), *arguments, **keyValueArguments)
+                except Exception as e:
+                    log.error("could not call '%s.%s' because '%s'", name, event, e)
+            try:
+                wrapperResults = callWithVariableArguments(getattr(self.eventHandlerWrapper, event), *arguments, **keyValueArguments)
+                results.update(wrapperResults)
+            except Exception as e:
+                log.error("could not call 'eventHandlerWrapper.%s' because '%s'", event, e)
+            return results
+        setattr(self, event, types.MethodType(handle, self))
+
+@ClassLogger
+class EventHandlerWrapper(EventHandler):
+    """
+    A Raft event handler wrapper implementation for individual events
+
+    :param events: event to functional handler mapping
+    :type events: dict
+    """
+    def __init__(self, events):
+        super(EventHandlerWrapper, self).__init__()
+        knownEvents = set()
+        # dynamically attach event handler proxies for the known events
+        for name, _ in inspect.getmembers(EventHandler, inspect.ismethod):
+            if not name.startswith("_"):
+                knownEvents.add(name)
+                rawHandlers = events.get(name, [])
+
+                # make sure we have a list
+                if isinstance(rawHandlers, (str, unicode)):
+                    rawHandlers = [rawHandlers]
+
+                # load actual handler implementations
+                handlers = []
+                for rawHandler in rawHandlers:
+                    handler = load(rawHandler)
+                    if handler:
+                        handlers.append(handler)
+
+                self.updateHandler(name, handlers)
+
+        unknownEvents = set(events.keys()).discard(knownEvents)
+        if unknownEvents:
+            log.warn("found unknown events '%s'", unknownEvents)
+
+    def updateHandler(self, event, handlers):
+        """
+        Dynamically attach a handler proxy method to this instance for the specified event
+
+        :param event: event name
+        :type event: str
+        :param handlers: list of handler functions to be called
+        :type handlers: [func]
+        """
+        def handle(self, *arguments, **keyValueArguments):
+            results = {}
+            for handler in handlers:
+                name = "{module}.{name}".format(module=getFullModuleName(handler), name=handler.__name__)
+                try:
+                    results[name] = callWithVariableArguments(handler, *arguments, **keyValueArguments)
+                except Exception as e:
+                    log.error("could not call '%s' for '%s' because '%s'", name, event, e)
+            return results
+        setattr(self, event, types.MethodType(handle, self))
+
 class Heartbeat(Envelope):
     """
     Raft heartbeat
@@ -190,6 +370,44 @@ class Heartbeat(Envelope):
             self.Message["systemManagerAddress"] = systemManagerAddress
 
 @ClassLogger
+class HeartbeatProcess(multiprocessing.Process):
+    """
+    The extended heartbeat process executing hooks for performing a more
+    detailed assessment of the node/system.
+
+    :param node: node name
+    :type node: str
+    :param eventHandlers: event handler proxy
+    :type eventHandlers: :class:`~EventHandlerProxy`
+    :param properties: properties
+    :type properties: dict
+    """
+    def __init__(self, node, eventHandlers, properties=None):
+        super(HeartbeatProcess, self).__init__(name="RaftHeartbeatProcess {node}".format(node=node))
+        self.eventHandlers = eventHandlers
+        self.properties = properties if properties else {}
+        self.stopFlag = multiprocessing.Event()
+        self.details = SharedDictWithLock()
+
+    def run(self):
+        """
+        The implementation of the heartbeat monitoring process
+        """
+        time.sleep(self.properties.get("heartbeat.perform.initial", 0))
+
+        counter = self.properties.get("heartbeat.perform.interval", 5)
+        while not self.stopFlag.is_set():
+            if counter <= 0:
+                self.details.lock.acquire()
+                for key in self.details.keys():
+                    del self.details[key]
+                self.details.lock.release()
+                self.eventHandlers.performHeartbeat(self.details)
+                counter = self.properties.get("heartbeat.interval", 5)
+            counter -= 1
+            time.sleep(1)
+
+@ClassLogger
 class Raft(DeviceManagerImplementation):
     """
     A Raft based high availability device manager
@@ -204,6 +422,14 @@ class Raft(DeviceManagerImplementation):
     def __init__(self, clusterInfo, name, properties=None):
         super(Raft, self).__init__(clusterInfo, name, properties=properties)
         self.raftProcess = None
+        self.heartbeatProcess = None
+
+        # set up event handlers
+        info = EventHandlerInfo()
+        eventHandlers = self.properties.get("event.handlers", {})
+        info.events = eventHandlers.get("events", {})
+        info.handlers = eventHandlers.get("handlers", [])
+        self.eventHandlers = EventHandlerProxy(info)
 
     def handleForwardHeartbeatResponse(self, message, envelope):
         """
@@ -221,8 +447,7 @@ class Raft(DeviceManagerImplementation):
         heartBeat = Heartbeat(message["from"],
                               envelope.From,
                               self.node,
-                              self.raftProcess.election.term,
-                              )
+                              self.raftProcess.election.term)
         heartBeat.toResponse(message["response"])
         client.forwardMessage(heartBeat)
 
@@ -257,6 +482,11 @@ class Raft(DeviceManagerImplementation):
 
         # TODO: check heartbeat message term and leader and compare to my information
         response = {
+            # add details from extended heartbeat
+            "details": {
+                key: self.heartbeatProcess.details[key]
+                for key in self.heartbeatProcess.details.keys()
+            },
             "leader": self.raftProcess.election.votedFor,
             "term": self.raftProcess.election.term
         }
@@ -301,11 +531,21 @@ class Raft(DeviceManagerImplementation):
             if raftDeviceManagerAddress not in self.raftProcess.unavailable.keys():
                 log.info("detected unavailable node %s", raftDeviceManagerAddress)
                 self.raftProcess.unavailable[raftDeviceManagerAddress] = detected
+                # note that because of our approach where passive node respond to the active node
+                # it is implied that event handling only happens on the active node
+                self.eventHandlers.handleNodeLeave(raftDeviceManagerAddress.split("/")[0])
 
         # TODO: handle nodes that become available again
 
-        # update heart beat dictionary
-        self.raftProcess.heartbeats[envelope.From] = time.time()
+        # check on whether additional details check is necessary
+        if message.get("details", {}):
+            checkResults = self.eventHandlers.checkHeartbeat(message["details"])
+            if all(checkResults.values()):
+                # update heart beat dictionary
+                self.raftProcess.heartbeats[envelope.From] = time.time()
+        else:
+            # update heart beat dictionary
+            self.raftProcess.heartbeats[envelope.From] = time.time()
 
     def handleLocalStartDeviceManager(self, message, envelope):
         """
@@ -317,8 +557,15 @@ class Raft(DeviceManagerImplementation):
         :type envelope: :class:`~c4.system.messages.Envelope`
         """
         response = super(Raft, self).handleLocalStartDeviceManager(message, envelope)
-        self.raftProcess = RaftProcess(self.clusterInfo, self.name, self.properties)
+        self.raftProcess = RaftProcess(self.clusterInfo,
+                                       self.name,
+                                       self.eventHandlers,
+                                       self.properties)
         self.raftProcess.start()
+        self.heartbeatProcess = HeartbeatProcess(self.clusterInfo.node,
+                                                 self.eventHandlers,
+                                                 properties=self.properties)
+        self.heartbeatProcess.start()
         return response
 
     def handleLocalStopDeviceManager(self, message, envelope):
@@ -331,6 +578,8 @@ class Raft(DeviceManagerImplementation):
         :type envelope: :class:`~c4.system.messages.Envelope`
         """
         response = super(Raft, self).handleLocalStopDeviceManager(message, envelope)
+        self.heartbeatProcess.stopFlag.set()
+        self.heartbeatProcess.join()
         self.raftProcess.stopFlag.set()
         self.raftProcess.join()
         return response
@@ -353,7 +602,7 @@ class Raft(DeviceManagerImplementation):
             self.raftProcess.election.term = message["term"]
             message["votedFor"] = requestingNode
             self.raftProcess.election.votedFor = requestingNode
-        elif message["term"] == self.raftProcess.election.term and not self.raftProcess.election.voted:
+        elif message["term"] == self.raftProcess.election.term and not self.raftProcess.election.votedFor:
             # current term but not voted yet, so vote
             message["votedFor"] = requestingNode
             self.raftProcess.election.votedFor = requestingNode
@@ -393,10 +642,9 @@ class Raft(DeviceManagerImplementation):
         # add information on unavailable nodes
         if self.raftProcess.unavailable.keys():
             status.unavailable = {}
-            for node in self.raftProcess.unavailable.keys():
-                detected = datetime.datetime.utcfromtimestamp(self.raftProcess.unavailable[node])
-                status.unavailable[node] = "{:%Y-%m-%d %H:%M:%S}.{:03d}".format(detected, detected.microsecond // 1000)
-
+            for raftDeviceManagerAddress in self.raftProcess.unavailable.keys():
+                detected = datetime.datetime.utcfromtimestamp(self.raftProcess.unavailable[raftDeviceManagerAddress])
+                status.unavailable[raftDeviceManagerAddress.split("/")[0]] = "{:%Y-%m-%d %H:%M:%S}.{:03d}".format(detected, detected.microsecond // 1000)
         return status
 
 @ClassLogger
@@ -410,14 +658,18 @@ class RaftProcess(multiprocessing.Process):
     :type clusterInfo: :class:`~c4.system.configuration.DBClusterInfo`
     :param deviceManagerName: Raft device manager name
     :type deviceManagerName: str
+    :param eventHandlers: event handlers
+    :type eventHandlers: :class:`~EventHandlerProxy`
     :param properties: optional properties
     :type properties: dict
     """
-    def __init__(self, clusterInfo, deviceManagerName, properties):
+    def __init__(self, clusterInfo, deviceManagerName, eventHandlers, properties):
         super(RaftProcess, self).__init__(name="RaftProcess {node}".format(node=clusterInfo.node))
         self.clusterInfo = clusterInfo
         self.raftDeviceManagerName = deviceManagerName
         self.raftDeviceManagerAddress = "{node}/{name}".format(node=clusterInfo.node, name=deviceManagerName)
+        self.raftDeviceManagerClient = None
+        self.eventHandlers = eventHandlers
         self.properties = properties
         self.stopFlag = multiprocessing.Event()
 
@@ -443,10 +695,14 @@ class RaftProcess(multiprocessing.Process):
                 if raftDeviceManagerAddress not in self.unavailable:
                     self.log.info("node '%s' detected node '%s' heart beat time out", self.node, raftDeviceManagerAddress)
                     self.unavailable[raftDeviceManagerAddress] = now
+                    if self.raftRole == RaftRoles.LEADER:
+                        self.eventHandlers.handleNodeLeave(raftDeviceManagerAddress.split("/")[0])
             else:
                 if raftDeviceManagerAddress in self.unavailable:
                     self.log.info("node '%s' detected node '%s' heart beat again", self.node, raftDeviceManagerAddress)
                     del self.unavailable[raftDeviceManagerAddress]
+                    if self.raftRole == RaftRoles.LEADER:
+                        self.eventHandlers.handleNodeJoin(raftDeviceManagerAddress.split("/")[0])
 
     def getHAEnabledNodes(self):
         """
@@ -569,11 +825,13 @@ class RaftProcess(multiprocessing.Process):
                                       systemManagerAddress=self.clusterInfo.systemManagerAddress)
                 self.raftDeviceManagerClient.forwardMessage(heartBeat)
 
+            self.eventHandlers.handleNewLeaderElected(self.node)
+
     def performFollowerRole(self):
         """
         Perform `follower` role
         """
-        if (self.clusterInfo.role == Roles.PASSIVE):
+        if self.clusterInfo.role == Roles.PASSIVE:
 
             self.checkHeartbeats()
 
@@ -692,6 +950,7 @@ class RaftStatus(DeviceManagerStatus):
     def __init__(self, role):
         super(RaftStatus, self).__init__()
         self.role = role
+        self.unavailable = {}
 
 class RequestVote(Envelope):
     """
@@ -709,3 +968,23 @@ class RequestVote(Envelope):
         self.Message = {
             "term": term
         }
+
+def load(fullName):
+    """
+    Based of the specified fully qualified name, load a function or class
+
+    :param fullName: fully qualified function or class name
+    :param fullName: str
+    :returns: function or class
+    """
+    try:
+        # get function or class info
+        info = fullName.split(".")
+        name = info.pop()
+        moduleName = ".".join(info)
+        # load function or class from module
+        module = __import__(moduleName, fromlist=[name])
+        return getattr(module, name)
+    except Exception:
+        log.error("could not load '%s'", fullName)
+    return None
