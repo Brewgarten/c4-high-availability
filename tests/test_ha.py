@@ -5,7 +5,7 @@ import pytest
 
 from c4.devices.ha.raft import RaftRoles, EventHandlerInfo
 from c4.messaging.zeromqMessaging import RouterClient
-from c4.system.configuration import Configuration
+from c4.system.backend import Backend
 from c4.system.messages import Status
 from c4.utils.util import getFullModuleName, SharedDictWithLock
 
@@ -46,7 +46,7 @@ class TestActiveNode():
 
         time.sleep(10)
 
-        configuration = Configuration()
+        configuration = Backend().configuration
         activeNode = configuration.getSystemManagerNodeName()
         assert activeNode != "node1"
         assert eventHandlerResults["handleNewLeaderElected"] != "node1"
@@ -67,7 +67,7 @@ class TestPassiveNode():
 
         time.sleep(10)
 
-        configuration = Configuration()
+        configuration = Backend().configuration
         activeNode = configuration.getSystemManagerNodeName()
 
         client = RouterClient(activeNode)
@@ -94,7 +94,7 @@ class TestThinNode():
 
         time.sleep(10)
 
-        configuration = Configuration()
+        configuration = Backend().configuration
         activeNode = configuration.getSystemManagerNodeName()
 
         client = RouterClient(activeNode)

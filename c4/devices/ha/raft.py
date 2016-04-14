@@ -50,7 +50,8 @@ import time
 import types
 
 from c4.messaging import (Envelope, RouterClient)
-from c4.system.configuration import (Configuration, Roles, States)
+from c4.system.backend import Backend
+from c4.system.configuration import (Roles, States)
 from c4.system.deviceManager import (DeviceManagerImplementation, DeviceManagerStatus)
 from c4.utils.enum import Enum
 from c4.utils.jsonutil import JSONSerializable
@@ -711,7 +712,7 @@ class RaftProcess(multiprocessing.Process):
         :returns: passive nodes and thin nodes with device manager information
         :rtype: (dict, dict)
         """
-        configuration = Configuration()
+        configuration = Backend().configuration
 
         passiveNodes = {}
         thinNodes = {}
@@ -806,7 +807,7 @@ class RaftProcess(multiprocessing.Process):
             self.log.info("'%s' has been elected new leader", self.node)
 
             # perform failover
-            configuration = Configuration()
+            configuration = Backend().configuration
             oldActiveSystemManager = configuration.getSystemManagerNodeName()
             configuration.changeRole(oldActiveSystemManager, Roles.PASSIVE)
             configuration.changeRole(self.node, Roles.ACTIVE)

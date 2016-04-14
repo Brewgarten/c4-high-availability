@@ -7,8 +7,9 @@ import tempfile
 
 import pytest
 
-from c4.system.configuration import (Configuration,
-                                     DBClusterInfo, DeviceInfo,
+from c4.backends.sharedSQLite import SharedSqliteDBBackend
+from c4.system.backend import Backend, BackendInfo
+from c4.system.configuration import (DBClusterInfo, DeviceInfo,
                                      NodeInfo,
                                      PlatformInfo,
                                      Roles)
@@ -35,7 +36,7 @@ def cleandir(request):
     return newCurrentWorkingDirectory
 
 @pytest.fixture
-def system(request, temporaryDatabasePaths, cleandir, temporaryIPCPath, systemManagerAvailability):
+def system(request, temporaryBackend, cleandir, temporaryIPCPath, systemManagerAvailability):
     """
     Set up a basic system configuration
     """
@@ -47,7 +48,7 @@ def system(request, temporaryDatabasePaths, cleandir, temporaryIPCPath, systemMa
     heartbeatInterval = parameters.get("heartbeat.interval", 2)
     heartbeatTimeout = parameters.get("heartbeat.timeout", 5)
 
-    configuration = Configuration()
+    configuration = temporaryBackend.configuration
     platform = PlatformInfo("ha-test", "c4.system.platforms.ha.HA")
     configuration.addPlatform(platform)
 
@@ -102,7 +103,7 @@ def system(request, temporaryDatabasePaths, cleandir, temporaryIPCPath, systemMa
     def systemTeardown():
         log.info("stopping test")
 
-        systemManagerNode = Configuration().getSystemManagerNodeName()
+        systemManagerNode = temporaryBackend.configuration.getSystemManagerNodeName()
         activeSystemManager = systemSetup.pop(systemManagerNode)
 
         for node, systemManager in reversed(sorted(systemSetup.items())):
@@ -157,21 +158,42 @@ def systemManagerAvailability(monkeypatch):
             self._available.value = False
     monkeypatch.setattr("c4.system.manager.SystemManager.setUnavailable", setUnavailable, raising=False)
 
-@pytest.fixture
-def temporaryDatabasePaths(request, monkeypatch):
+@pytest.fixture(scope="function")
+def temporaryBackend(request):
     """
-    Create a new temporary directory and set c4.system.db.BACKUP_PATH
-    and c4.system.db.DATABASE_PATH to it
+    Set backend to something temporary for testing
     """
+    # save old backend
+    try:
+        oldBackend = Backend()
+    except ValueError:
+        newpath = tempfile.mkdtemp(dir="/dev/shm")
+        log.info("setting default temp backend to use '%s' as part of testing", newpath)
+        infoProperties = {
+            "path.database": newpath,
+            "path.backup": newpath
+        }
+        info = BackendInfo("c4.backends.sharedSQLite.SharedSqliteDBBackend", properties=infoProperties)
+        oldBackend = SharedSqliteDBBackend(info)
+
     newpath = tempfile.mkdtemp(dir="/dev/shm")
 #     newpath = tempfile.mkdtemp(dir="/tmp")
-    monkeypatch.setattr("c4.system.db.BACKUP_PATH", newpath)
-    monkeypatch.setattr("c4.system.db.DATABASE_PATH", newpath)
+    infoProperties = {
+        "path.database": newpath,
+        "path.backup": newpath
+    }
+    info = BackendInfo("c4.backends.sharedSQLite.SharedSqliteDBBackend", properties=infoProperties)
+    testBackendImplementation = SharedSqliteDBBackend(info)
+
+    # change backend
+    newBackend = Backend(implementation=testBackendImplementation)
 
     def removeTemporaryDirectory():
+        # change backend back
+        Backend(implementation=oldBackend)
         shutil.rmtree(newpath)
     request.addfinalizer(removeTemporaryDirectory)
-    return newpath
+    return newBackend
 
 @pytest.fixture
 def temporaryIPCPath(request, monkeypatch):
