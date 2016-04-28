@@ -3,8 +3,11 @@ import time
 
 import pytest
 
-from c4.devices.ha.raft import (EventHandler, EventHandlerInfo, EventHandlerProxy,
-                                HeartbeatProcess)
+from c4.devices.ha.raft import (CheckHeartbeatEvent,
+                                EventHandler, EventHandlerInfo, EventHandlerProxy,
+                                HeartbeatProcess, PerformHeartbeatEvent)
+from c4.system.backend import Backend
+from c4.system.configuration import Roles, SharedClusterInfo, States
 from c4.utils.util import getFullModuleName
 
 
@@ -30,44 +33,48 @@ def testEventHandlerInfo():
 
 class SampleEventHandler(EventHandler):
 
-    def performHeartbeat(self, details):
-        details["SampleEventHandler.performHeartbeat"] = True
+    def performHeartbeat(self, event):
+        event.details["SampleEventHandler.performHeartbeat"] = True
 
-    def checkHeartbeat(self, details):
-        return details.get("SampleEventHandler.performHeartbeat", False) == True
+    def checkHeartbeat(self, event):
+        return event.details.get("SampleEventHandler.performHeartbeat", False) == True
 
-def checkHeartbeat(details):
-    return details.get("performHeartbeat", False) == True
+def checkHeartbeat(event):
+    return event.details.get("performHeartbeat", False) == True
 
-def checkHeartbeat2(details):
-    return details.get("performHeartbeat", False) == True
+def checkHeartbeat2(event):
+    return event.details.get("performHeartbeat", False) == True
 
-def handleNewLeaderElected(name):
-    log.info("event handling new leader '%s' elected", name)
+def handleNewLeaderElected(event):
+    log.info("event handling new leader '%s' elected", event.newLeader)
 
-def handleNodeLeave(name):
-    log.info("event handling node '%s' leave", name)
+def handleNodeLeave(event):
+    log.info("event handling node '%s' leave", event.node)
 
-def performHeartbeat(details):
-    details["performHeartbeat"] = True
+def performHeartbeat(event):
+    event.details["performHeartbeat"] = True
 
-def test_EventHandlerProxy(testEventHandlerInfo):
+def test_EventHandlerProxy(testEventHandlerInfo, temporaryBackend):
 
     details = {}
     handlers = EventHandlerProxy(testEventHandlerInfo)
-    handlers.performHeartbeat(details)
+    handlers.performHeartbeat(PerformHeartbeatEvent("testClusterInfoPlaceholder", details))
     assert details["SampleEventHandler.performHeartbeat"]
     assert details["performHeartbeat"]
 
-    results = handlers.checkHeartbeat(details)
+    clusterInfo = SharedClusterInfo(Backend(), "testNode", "testAddress", "testSystemManagerAddress", Roles.ACTIVE, States.RUNNING)
+
+    results = handlers.checkHeartbeat(CheckHeartbeatEvent(clusterInfo, "testNode", details))
     assert results["test_handlers.SampleEventHandler"]
     assert results["test_handlers.checkHeartbeat"]
     assert results["test_handlers.checkHeartbeat2"]
 
-def test_HeartbeatProcess(testEventHandlerInfo):
+def test_HeartbeatProcess(testEventHandlerInfo, temporaryBackend):
+
+    clusterInfo = SharedClusterInfo(Backend(), "testNode", "testAddress", "testSystemManagerAddress", Roles.ACTIVE, States.RUNNING)
 
     handlers = EventHandlerProxy(testEventHandlerInfo)
-    heartbeatProcess = HeartbeatProcess("test", handlers, {"heartbeat.perform.interval": 1})
+    heartbeatProcess = HeartbeatProcess(clusterInfo, handlers, {"heartbeat.perform.interval": 1})
     heartbeatProcess.start()
 
     time.sleep(2)

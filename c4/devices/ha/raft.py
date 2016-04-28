@@ -57,11 +57,32 @@ from c4.utils.enum import Enum
 from c4.utils.jsonutil import JSONSerializable
 from c4.utils.logutil import ClassLogger
 from c4.utils.util import (SharedDictWithLock,
-                           callWithVariableArguments,
                            getFullModuleName)
 
 
 log = logging.getLogger(__name__)
+
+class Event(object):
+    """
+    Base Raft event class
+    """
+    __metaclass__ = ABCMeta
+
+class CheckHeartbeatEvent(Event):
+    """
+    Detailed heartbeat check event
+
+    :param clusterInfo: cluster information of the node that is checking
+    :type clusterInfo: :class:`~c4.system.configuration.DBClusterInfo`
+    :param node: name of the node from which the details originated
+    :type node: str
+    :param details: details to be checked
+    :type details: dict
+    """
+    def __init__(self, clusterInfo, node, details):
+        self.clusterInfo = clusterInfo
+        self.node = node
+        self.details = details
 
 @ClassLogger
 class Election(object):
@@ -174,44 +195,55 @@ class EventHandler(object):
     """
     __metaclass__ = ABCMeta
 
-    def checkHeartbeat(self, details):
+    def checkHeartbeat(self, event):
         """
         Check heartbeat detailed results
 
-        :param details: details to be checked
-        :type details: dict
+        :param event: check heartbeat event
+        :type event: :class:`~CheckHeartbeatEvent`
+        :returns: `True` if heartbeat is ok, `False` otherwise
+        :rtype: bool
         """
+        return True
 
-    def handleNewLeaderElected(self, name):
+    def handleNewLeaderElected(self, event):
         """
         Handle new `leader` elected event
 
-        :param name: new `leader` node
-        :type name: str
+        :param event: new `leader` elected event
+        :type event: :class:`~NewLeaderElectedEvent`
         """
 
-    def handleNodeJoin(self, name):
+    def handleNodeJoin(self, event):
         """
         Handle node join event
 
-        :param name: node that joined
-        :type name: str
+        :param event: node join event
+        :type event: :class:`~NodeJoinEvent`
         """
 
-    def handleNodeLeave(self, name):
+    def handleNodeLeave(self, event):
         """
         Handle node leave event
 
-        :param name: node that joined
-        :type name: str
+        :param event: node leave event
+        :type event: :class:`~NodeLeaveEvent`
         """
 
-    def performHeartbeat(self, details):
+    def handleNodeRejoin(self, event):
+        """
+        Handle node rejoin event
+
+        :param event: node rejoin event
+        :type event: :class:`~NodeRejoinEvent`
+        """
+
+    def performHeartbeat(self, event):
         """
         Perform detailed heartbeat and store results in details
 
-        :param details: details
-        :type details: dict
+        :param event: perform heartbeat event
+        :type event: :class:`~PerformHeartbeatEvent`
         """
 
 class EventHandlerInfo(JSONSerializable):
@@ -265,28 +297,28 @@ class EventHandlerProxy(EventHandler):
             if not name.startswith("_"):
                 self.updateHandler(name)
 
-    def updateHandler(self, event):
+    def updateHandler(self, eventName):
         """
         Dynamically attach a handler proxy method to this instance for the specified event
 
-        :param event: event name
-        :type event: str
+        :param eventName: event name
+        :type eventName: str
         """
-        def handle(self, *arguments, **keyValueArguments):
+        def handle(self, event):
             results = {}
             for handler in self.handlers:
                 name = "{module}.{name}".format(module=getFullModuleName(handler), name=handler.__class__.__name__)
                 try:
-                    results[name] = callWithVariableArguments(getattr(handler, event), *arguments, **keyValueArguments)
+                    results[name] = getattr(handler, eventName)(event)
                 except Exception as e:
-                    log.error("could not call '%s.%s' because '%s'", name, event, e)
+                    log.error("could not call '%s.%s' because '%s'", name, eventName, e)
             try:
-                wrapperResults = callWithVariableArguments(getattr(self.eventHandlerWrapper, event), *arguments, **keyValueArguments)
+                wrapperResults = getattr(self.eventHandlerWrapper, eventName)(event)
                 results.update(wrapperResults)
             except Exception as e:
-                log.error("could not call 'eventHandlerWrapper.%s' because '%s'", event, e)
+                log.error("could not call 'eventHandlerWrapper.%s' because '%s'", eventName, e)
             return results
-        setattr(self, event, types.MethodType(handle, self))
+        setattr(self, eventName, types.MethodType(handle, self))
 
 @ClassLogger
 class EventHandlerWrapper(EventHandler):
@@ -322,25 +354,25 @@ class EventHandlerWrapper(EventHandler):
         if unknownEvents:
             log.warn("found unknown events '%s'", unknownEvents)
 
-    def updateHandler(self, event, handlers):
+    def updateHandler(self, eventName, handlers):
         """
         Dynamically attach a handler proxy method to this instance for the specified event
 
-        :param event: event name
-        :type event: str
+        :param eventName: event name
+        :type eventName: str
         :param handlers: list of handler functions to be called
         :type handlers: [func]
         """
-        def handle(self, *arguments, **keyValueArguments):
+        def handle(self, event):
             results = {}
             for handler in handlers:
                 name = "{module}.{name}".format(module=getFullModuleName(handler), name=handler.__name__)
                 try:
-                    results[name] = callWithVariableArguments(handler, *arguments, **keyValueArguments)
+                    results[name] = handler(event)
                 except Exception as e:
-                    log.error("could not call '%s' for '%s' because '%s'", name, event, e)
+                    log.error("could not call '%s' for '%s' because '%s'", name, eventName, e)
             return results
-        setattr(self, event, types.MethodType(handle, self))
+        setattr(self, eventName, types.MethodType(handle, self))
 
 class Heartbeat(Envelope):
     """
@@ -376,15 +408,16 @@ class HeartbeatProcess(multiprocessing.Process):
     The extended heartbeat process executing hooks for performing a more
     detailed assessment of the node/system.
 
-    :param node: node name
-    :type node: str
+    :param clusterInfo: cluster information
+    :type clusterInfo: :class:`~c4.system.configuration.DBClusterInfo`
     :param eventHandlers: event handler proxy
     :type eventHandlers: :class:`~EventHandlerProxy`
     :param properties: properties
     :type properties: dict
     """
-    def __init__(self, node, eventHandlers, properties=None):
-        super(HeartbeatProcess, self).__init__(name="RaftHeartbeatProcess {node}".format(node=node))
+    def __init__(self, clusterInfo, eventHandlers, properties=None):
+        self.clusterInfo = clusterInfo
+        super(HeartbeatProcess, self).__init__(name="RaftHeartbeatProcess {node}".format(node=clusterInfo.node))
         self.eventHandlers = eventHandlers
         self.properties = properties if properties else {}
         self.stopFlag = multiprocessing.Event()
@@ -403,10 +436,71 @@ class HeartbeatProcess(multiprocessing.Process):
                 for key in self.details.keys():
                     del self.details[key]
                 self.details.lock.release()
-                self.eventHandlers.performHeartbeat(self.details)
-                counter = self.properties.get("heartbeat.interval", 5)
+                self.eventHandlers.performHeartbeat(
+                    PerformHeartbeatEvent(
+                        self.clusterInfo,
+                        self.details
+                    )
+                )
+                counter = self.properties.get("heartbeat.perform.interval", 5)
             counter -= 1
             time.sleep(1)
+
+class NewLeaderElectedEvent(Event):
+    """
+    New leader elected event
+
+    :param oldLeader: old `leader` node
+    :type oldLeader: str
+    :param newLeader: new `leader` node
+    :type newLeader: str
+    """
+    def __init__(self, oldLeader, newLeader):
+        self.oldLeader = oldLeader
+        self.newLeader = newLeader
+
+class NodeJoinEvent(Event):
+    """
+    New node joining the cluster event
+
+    :param node: node that joined
+    :type node: str
+    """
+    def __init__(self, node):
+        self.node = node
+
+class NodeLeaveEvent(Event):
+    """
+    Node leaving the cluster event
+
+    :param node: node that left
+    :type node: str
+    """
+    def __init__(self, node):
+        self.node = node
+
+class NodeRejoinEvent(Event):
+    """
+    Node rejoining after leaving previously leaving the cluster event
+
+    :param node: node that rejoined
+    :type node: str
+    """
+    def __init__(self, node):
+        self.node = node
+
+class PerformHeartbeatEvent(Event):
+    """
+    Performing detailed heartbeat event
+
+    :param clusterInfo: cluster information of the node that is performing the heartbeat
+    :type clusterInfo: :class:`~c4.system.configuration.DBClusterInfo`
+    :param details: details to be filled with detailed heartbeat information
+    :type details: dict
+    """
+    def __init__(self, clusterInfo, details):
+        self.clusterInfo = clusterInfo
+        self.details = details
 
 @ClassLogger
 class Raft(DeviceManagerImplementation):
@@ -534,19 +628,36 @@ class Raft(DeviceManagerImplementation):
                 self.raftProcess.unavailable[raftDeviceManagerAddress] = detected
                 # note that because of our approach where passive node respond to the active node
                 # it is implied that event handling only happens on the active node
-                self.eventHandlers.handleNodeLeave(raftDeviceManagerAddress.split("/")[0])
+                self.eventHandlers.handleNodeLeave(
+                    NodeLeaveEvent(raftDeviceManagerAddress.split("/")[0])
+                )
 
         # TODO: handle nodes that become available again
 
+        # check if this is a new node joining
+        nodeJoinEvent = None
+        if envelope.From not in self.raftProcess.heartbeats:
+            nodeJoinEvent = NodeJoinEvent(envelope.From.split("/")[0])
+
         # check on whether additional details check is necessary
         if message.get("details", {}):
-            checkResults = self.eventHandlers.checkHeartbeat(message["details"])
+            checkResults = self.eventHandlers.checkHeartbeat(
+                CheckHeartbeatEvent(
+                    self.clusterInfo,
+                    envelope.From.split("/")[0],
+                    message["details"]
+                )
+            )
             if all(checkResults.values()):
                 # update heart beat dictionary
                 self.raftProcess.heartbeats[envelope.From] = time.time()
+                if nodeJoinEvent:
+                    self.eventHandlers.handleNodeJoin(nodeJoinEvent)
         else:
             # update heart beat dictionary
             self.raftProcess.heartbeats[envelope.From] = time.time()
+            if nodeJoinEvent:
+                self.eventHandlers.handleNodeJoin(nodeJoinEvent)
 
     def handleLocalStartDeviceManager(self, message, envelope):
         """
@@ -563,7 +674,7 @@ class Raft(DeviceManagerImplementation):
                                        self.eventHandlers,
                                        self.properties)
         self.raftProcess.start()
-        self.heartbeatProcess = HeartbeatProcess(self.clusterInfo.node,
+        self.heartbeatProcess = HeartbeatProcess(self.clusterInfo,
                                                  self.eventHandlers,
                                                  properties=self.properties)
         self.heartbeatProcess.start()
@@ -697,13 +808,17 @@ class RaftProcess(multiprocessing.Process):
                     self.log.info("node '%s' detected node '%s' heart beat time out", self.node, raftDeviceManagerAddress)
                     self.unavailable[raftDeviceManagerAddress] = now
                     if self.raftRole == RaftRoles.LEADER:
-                        self.eventHandlers.handleNodeLeave(raftDeviceManagerAddress.split("/")[0])
+                        self.eventHandlers.handleNodeLeave(
+                            NodeLeaveEvent(raftDeviceManagerAddress.split("/")[0])
+                        )
             else:
                 if raftDeviceManagerAddress in self.unavailable:
                     self.log.info("node '%s' detected node '%s' heart beat again", self.node, raftDeviceManagerAddress)
                     del self.unavailable[raftDeviceManagerAddress]
                     if self.raftRole == RaftRoles.LEADER:
-                        self.eventHandlers.handleNodeJoin(raftDeviceManagerAddress.split("/")[0])
+                        self.eventHandlers.handleNodeRejoin(
+                            NodeRejoinEvent(raftDeviceManagerAddress.split("/")[0])
+                        )
 
     def getHAEnabledNodes(self):
         """
@@ -826,7 +941,12 @@ class RaftProcess(multiprocessing.Process):
                                       systemManagerAddress=self.clusterInfo.systemManagerAddress)
                 self.raftDeviceManagerClient.forwardMessage(heartBeat)
 
-            self.eventHandlers.handleNewLeaderElected(self.node)
+            self.eventHandlers.handleNewLeaderElected(
+                NewLeaderElectedEvent(
+                    oldActiveSystemManager,
+                    self.node
+                )
+            )
 
     def performFollowerRole(self):
         """

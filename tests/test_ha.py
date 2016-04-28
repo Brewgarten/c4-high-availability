@@ -21,17 +21,21 @@ def cleanEventHandlerResults():
         del eventHandlerResults[key]
     eventHandlerResults.lock.release()
 
-def handleNewLeaderElected(name):
-    log.info("event handling new leader '%s' elected", name)
-    eventHandlerResults["handleNewLeaderElected"] = name
+def handleNewLeaderElected(event):
+    log.info("event handling new leader '%s' elected", event.newLeader)
+    eventHandlerResults["handleNewLeaderElected"] = event.newLeader
 
-def handleNodeLeave(name):
-    log.info("event handling node '%s' leave", name)
-    eventHandlerResults["handleNodeLeave"] = name
+def handleNodeJoin(event):
+    log.info("event handling node '%s' join", event.node)
+
+def handleNodeLeave(event):
+    log.info("event handling node '%s' leave", event.node)
+    eventHandlerResults["handleNodeLeave"] = event.node
 
 eventHandlers = EventHandlerInfo()
 eventHandlers.events = {
     "handleNewLeaderElected": getFullModuleName(handleNewLeaderElected) + ".handleNewLeaderElected",
+    "handleNodeJoin": getFullModuleName(handleNodeJoin) + ".handleNodeJoin",
     "handleNodeLeave": getFullModuleName(handleNodeLeave) + ".handleNodeLeave",
 }
 

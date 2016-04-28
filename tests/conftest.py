@@ -46,6 +46,7 @@ def system(request, temporaryBackend, cleandir, temporaryIPCPath, systemManagerA
     electionTimeout = parameters.get("election.timeout", 5)
     heartbeatInitial = parameters.get("heartbeat.initial", 0)
     heartbeatInterval = parameters.get("heartbeat.interval", 2)
+    heartbeatPerformInterval = parameters.get("heartbeat.perform.interval", 2)
     heartbeatTimeout = parameters.get("heartbeat.timeout", 5)
 
     configuration = temporaryBackend.configuration
@@ -57,6 +58,7 @@ def system(request, temporaryBackend, cleandir, temporaryIPCPath, systemManagerA
         "election.timeout": electionTimeout,
         "heartbeat.initial": heartbeatInitial,
         "heartbeat.interval": heartbeatInterval,
+        "heartbeat.perform.interval": heartbeatPerformInterval,
         "heartbeat.timeout": heartbeatTimeout
     }
     if "event.handlers" in parameters:
